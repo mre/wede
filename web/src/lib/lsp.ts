@@ -33,6 +33,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+// Keep eager sysroot warmup and syntax-tree retention modest on small hosts.
+// Diagnostics, cargo checks, build scripts, and proc macros keep server defaults.
+const RUST_RESOURCE_SETTINGS = {
+  numThreads: 1,
+  cachePriming: { enable: false },
+  lru: { capacity: 32 },
+} as const
+
+function rustConfiguration(section: unknown): unknown {
+  if (section === undefined || section === '') return { 'rust-analyzer': RUST_RESOURCE_SETTINGS }
+  if (typeof section !== 'string') return null
+  const [prefix, ...parts] = section.split('.')
+  if (prefix !== 'rust-analyzer') return null
+  let value: unknown = RUST_RESOURCE_SETTINGS
+  for (const part of parts) {
+    if (!isRecord(value) || !Object.hasOwn(value, part)) return null
+    value = value[part]
+  }
+  return value
+}
+
 // Unlike the package's WebSocketTransport, this transport is handed an already
 // open socket. Closing synchronously rejects pending RPCs and silences queued
 // notifications (including the package plugin's uncancellable didOpen await).
@@ -41,7 +62,12 @@ class OpenSocketTransport implements Transport {
   private listeners = new AbortController()
   private closeHandlers: (() => void)[] = []
 
-  constructor(private socket: WebSocket, private workspaceFolders: { uri: string; name: string }[], private onServerMessage: (message: string) => void) {
+  constructor(
+    private socket: WebSocket,
+    private workspaceFolders: { uri: string; name: string }[],
+    private onServerMessage: (message: string) => void,
+    private configuration: (section: unknown) => unknown,
+  ) {
     socket.addEventListener('close', () => this.close(), { signal: this.listeners.signal })
   }
 
@@ -78,9 +104,9 @@ class OpenSocketTransport implements Transport {
         if (!isRecord(params) || !Array.isArray(params.items) || !params.items.every(isRecord)) {
           reply({ error: { code: -32602, message: 'Expected configuration items' } })
         } else {
-          // No client-side settings: one null per item lets servers (including
-          // rust-analyzer) use their defaults. A scalar null is not a valid reply.
-          reply({ result: params.items.map(() => null) })
+          // Return only explicitly configured settings; null preserves server
+          // defaults for unknown sections and for every non-Rust session.
+          reply({ result: params.items.map(item => this.configuration(item.section)) })
         }
         break
       case 'workspace/workspaceFolders':
@@ -141,6 +167,7 @@ class OpenSocketTransport implements Transport {
 export function lspExtension(config: LspConfig): Extension[] {
   const features = new Compartment()
   const workspaceFolders = [{ uri: config.rootUri, name: config.rootUri }]
+  const rust = config.languageId === 'rust'
   return [features.of([]), ViewPlugin.define(view => {
     let stopped = false
     let socket: WebSocket | undefined
@@ -253,11 +280,15 @@ export function lspExtension(config: LspConfig): Extension[] {
         socket.addEventListener('open', () => {
           if (stopped || !socket) return
           clearTimeout(connectTimer)
-          transport = new OpenSocketTransport(socket, workspaceFolders, message => { serverMessage = message })
+          transport = new OpenSocketTransport(
+            socket, workspaceFolders, message => { serverMessage = message },
+            section => rust ? rustConfiguration(section) : null,
+          )
           const sessionClient = new DocumentClient({
             ...config,
             transport,
             workspaceFolders,
+            initializationOptions: rust ? RUST_RESOURCE_SETTINGS : undefined,
             autoClose: false,
             onError: () => fail('Language server initialization failed or timed out.'),
             onClose: () => fail(),

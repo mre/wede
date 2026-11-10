@@ -12,6 +12,7 @@ const config: LspConfig = {
   documentUri: 'file:///projects/one/src/main.rs',
   languageId: 'rust',
 }
+const rustSettings = { numThreads: 1, cachePriming: { enable: false }, lru: { capacity: 32 } }
 let views: EditorView[]
 function editor(extensions: Extension, doc = 'initial') {
   const view = new EditorView({ state: EditorState.create({ extensions, doc }), parent: document.body })
@@ -265,6 +266,52 @@ describe('editor-owned LSP', () => {
   })
 })
 
+describe('Rust resource settings', () => {
+  const sections = [
+    undefined, '', 'rust-analyzer', 'rust-analyzer.numThreads',
+    'rust-analyzer.cachePriming', 'rust-analyzer.cachePriming.enable',
+    'rust-analyzer.lru', 'rust-analyzer.lru.capacity',
+    'rust-analyzer.diagnostics', 'rust-analyzer.procMacro', 'rust-analyzer.check',
+    'rust-analyzer.unknown', 'rust-analyzer.lru.unknown', 'rust-analyzer-other',
+    'numThreads', 'rust-analyzer.__proto__', 'rust-analyzer.constructor',
+    'rust-analyzer.lru.toString', null,
+  ]
+
+  it('uses the same settings for initialize and configuration sections/subkeys', async () => {
+    editor(lspExtension(config))
+    await flushLsp()
+    const socket = LspSocket.instances[0]
+    await initialize(socket)
+    expect(socket.sent[0].params).toHaveProperty('initializationOptions', rustSettings)
+    // Unknown settings, notably diagnostics/proc macros, must keep defaults.
+    const expected = [
+      { 'rust-analyzer': rustSettings }, { 'rust-analyzer': rustSettings }, rustSettings, 1,
+      { enable: false }, false, { capacity: 32 }, 32,
+      ...Array<null>(11).fill(null),
+    ]
+    for (const scopeUri of [undefined, config.documentUri]) {
+      socket.receive({ jsonrpc: '2.0', id: 'settings', method: 'workspace/configuration', params: {
+        items: sections.map(section => ({ section, scopeUri })),
+      } })
+      await flushLsp()
+      expect(socket.sent.at(-1)).toEqual({ jsonrpc: '2.0', id: 'settings', result: expected })
+    }
+  })
+
+  it.each(['go', 'typescript', 'javascript', 'python', 'custom'])('does not change %s initialization or configuration', async languageId => {
+    editor(lspExtension({ ...config, languageId }))
+    await flushLsp()
+    const socket = LspSocket.instances[0]
+    await initialize(socket)
+    expect(socket.sent[0].params).toHaveProperty('initializationOptions', null)
+    socket.receive({ jsonrpc: '2.0', id: 0, method: 'workspace/configuration', params: {
+      items: sections.map(section => ({ section })),
+    } })
+    await flushLsp()
+    expect(socket.sent.at(-1)).toEqual({ jsonrpc: '2.0', id: 0, result: sections.map(() => null) })
+  })
+})
+
 describe('bidirectional JSON-RPC', () => {
   it('handles server request ID 0 without resolving client initialize ID 0', async () => {
     editor(lspExtension(config))
@@ -278,7 +325,7 @@ describe('bidirectional JSON-RPC', () => {
     } })
     await flushLsp()
     expect(socket.sent).toHaveLength(2)
-    expect(socket.sent[1]).toEqual({ jsonrpc: '2.0', id: 0, result: [null, null] })
+    expect(socket.sent[1]).toEqual({ jsonrpc: '2.0', id: 0, result: [rustSettings, null] })
     expect(socket.closeCalls).toBe(0)
     socket.initialized()
     await flushLsp()

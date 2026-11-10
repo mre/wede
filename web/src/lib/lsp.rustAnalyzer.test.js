@@ -100,6 +100,8 @@ it.skipIf(!analyzer).each([false, true])('real rust-analyzer initialization/conf
   try {
     await vi.waitFor(() => expect(view.plugin(languageServerPlugin)?.client.ready).toBe(true), { timeout: 10_000 })
     const socket = sockets[0]
+    const rustSettings = { numThreads: 1, cachePriming: { enable: false }, lru: { capacity: 32 } }
+    expect(socket.sent[0].params.initializationOptions).toEqual(rustSettings)
     expect(socket.sent[0].params?.capabilities).toMatchObject({ workspace: { configuration: true, workspaceFolders: true } })
     // Request a settings refresh through the real server's notification handler.
     // This must produce an actual workspace/configuration request and array reply.
@@ -110,7 +112,7 @@ it.skipIf(!analyzer).each([false, true])('real rust-analyzer initialization/conf
       for (const request of requests) {
         expect(request.params).toMatchObject({ items: expect.arrayContaining([{ section: 'rust-analyzer' }]) })
         const reply = socket.sent.find(m => m.method === undefined && m.id === request.id)
-        expect(reply).toMatchObject({ result: [null] })
+        expect(reply).toMatchObject({ result: [rustSettings] })
         expect(reply).not.toHaveProperty('error')
       }
     }, { timeout: 10_000 })
