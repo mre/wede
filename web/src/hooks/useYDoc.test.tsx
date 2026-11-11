@@ -6,13 +6,31 @@ import type * as Y from 'yjs'
 import type { Awareness } from 'y-protocols/awareness'
 import { useYDoc, type UseYDocParams, type UseYDocState } from './useYDoc'
 
-const { providers } = vi.hoisted(() => ({ providers: [] as { doc: Y.Doc; awareness: Awareness; destroy: () => void }[] }))
+interface TestProvider {
+  doc: Y.Doc
+  awareness: Awareness
+  destroy: () => void
+  wsconnected: boolean
+  synced: boolean
+  emit: (event: string, value?: unknown) => void
+}
+const { providers, failures } = vi.hoisted(() => ({ providers: [] as TestProvider[], failures: { construct: false } }))
 vi.mock('y-websocket', async () => {
   const { Awareness } = await import('y-protocols/awareness')
   return { WebsocketProvider: class {
     awareness: Awareness
+    wsconnected = false
+    synced = false
+    listeners = new Map<string, ((value: unknown) => void)[]>()
+    on(event: string, callback: (value: unknown) => void) {
+      this.listeners.set(event, [...(this.listeners.get(event) || []), callback])
+    }
+    emit(event: string, value?: unknown) {
+      for (const callback of this.listeners.get(event) || []) callback(value)
+    }
     destroy = vi.fn(() => this.awareness.destroy())
     constructor(_base: string, _room: string, public doc: Y.Doc) {
+      if (failures.construct) throw new Error('construction failed')
       this.awareness = new Awareness(doc)
       providers.push(this)
     }
@@ -31,6 +49,7 @@ function Harness({ params }: { params: UseYDocParams }) {
 beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
   providers.length = 0
+  failures.construct = false
   snapshots = []
   container = document.createElement('div')
   root = createRoot(container)
@@ -57,6 +76,62 @@ it.each([
   expect(snapshots.at(-1)?.ytext).not.toBeNull()
   expect(providers[0].destroy).toHaveBeenCalledOnce()
   expect(providers[0].doc.isDestroyed).toBe(true)
+})
+
+it('reports connection and sync lifecycle without losing unsent changes on reconnect', async () => {
+  await commit(() => root.render(<Harness params={defaults} />))
+  const provider = providers[0]
+  const text = snapshots.at(-1)!.ytext!
+  expect(snapshots.at(-1)?.status).toBe('connecting')
+  await commit(() => {
+    provider.wsconnected = true
+    provider.emit('status', { status: 'connected' })
+  })
+  expect(snapshots.at(-1)?.status).toBe('syncing')
+  await commit(() => { provider.synced = true; provider.emit('sync', true) })
+  expect(snapshots.at(-1)?.status).toBe('live')
+  text.insert(0, 'unsent edit')
+  await commit(() => provider.emit('connection-error'))
+  expect(snapshots.at(-1)?.status).toBe('error')
+  expect(snapshots.at(-1)?.ytext).toBe(text)
+  await commit(() => {
+    provider.wsconnected = false
+    provider.synced = false
+    provider.emit('sync', false)
+    provider.emit('connection-close')
+  })
+  expect(snapshots.at(-1)?.status).toBe('disconnected')
+  await commit(() => provider.emit('status', { status: 'connecting' }))
+  expect(snapshots.at(-1)?.status).toBe('connecting')
+  await commit(() => {
+    provider.wsconnected = true
+    provider.emit('status', { status: 'connected' })
+  })
+  expect(snapshots.at(-1)?.status).toBe('syncing')
+  await commit(() => { provider.synced = true; provider.emit('sync', true) })
+  expect(snapshots.at(-1)?.status).toBe('live')
+  expect(snapshots.at(-1)?.ytext).toBe(text)
+  expect(text.toJSON()).toBe('unsent edit')
+  expect(providers).toHaveLength(1)
+  expect(provider.destroy).not.toHaveBeenCalled()
+})
+
+it('blocks failed construction and missing credentials instead of reporting off', async () => {
+  failures.construct = true
+  await commit(() => root.render(<Harness params={defaults} />))
+  expect(snapshots.at(-1)?.status).toBe('error')
+  expect(snapshots.at(-1)?.ytext).toBeNull()
+  await commit(() => root.render(<Harness params={{ ...defaults, token: null }} />))
+  expect(snapshots.at(-1)?.status).toBe('error')
+})
+
+it('ignores late events from a replaced session', async () => {
+  await commit(() => root.render(<Harness params={defaults} />))
+  const old = providers[0]
+  await commit(() => root.render(<Harness params={{ ...defaults, path: 'new.rs' }} />))
+  const current = snapshots.at(-1)
+  await commit(() => { old.emit('connection-error'); old.emit('sync', true) })
+  expect(snapshots.at(-1)).toBe(current)
 })
 
 it('keeps the provider stable for the same identity and closes it when disabled', async () => {

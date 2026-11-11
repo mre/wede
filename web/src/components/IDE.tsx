@@ -30,6 +30,8 @@ import { createDocumentSaves, writeDocument } from '../lib/documentSaves'
 import LspStatusIndicator from './LspStatusIndicator'
 import { useCollab } from '../hooks/useCollab'
 import { useYDoc } from '../hooks/useYDoc'
+import { effectiveCollaboration } from '../lib/collaboration'
+import CollaborationStatusIndicator from './CollaborationStatusIndicator'
 import ShareModal from './ShareModal'
 import Chat from './Chat'
 import ApiClient from './ApiClient'
@@ -357,8 +359,9 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
   // After a configurable debounce (1.5 s by default) auto-save dirty tabs.
   const [documentSaves] = useState(createDocumentSaves)
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const collabEnabled = effectiveCollaboration(editorSettings)
   const triggerAutoSave = useCallback((tab: Tab, content: string) => {
-    if (!editorSettings.autoSave) return
+    if (collabEnabled || role === 'viewer' || !editorSettings.autoSave) return
     clearTimeout(autoSaveTimerRef.current)
     autoSaveTimerRef.current = setTimeout(async () => {
       setAutoSaveStatus('saving')
@@ -373,8 +376,8 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
         setAutoSaveStatus('')
       }
     }, 1500)
-  }, [authFetch, editorSettings.autoSave, documentSaves])
-  useEffect(() => () => clearTimeout(autoSaveTimerRef.current), [])
+  }, [authFetch, editorSettings.autoSave, documentSaves, collabEnabled, role])
+  useEffect(() => () => clearTimeout(autoSaveTimerRef.current), [collabEnabled, role])
 
   // ── Close tab ── (defined here so it is reachable by the keyboard-shortcut
   // useEffect below — Vite/Rolldown's const hoisting can trigger a TDZ when
@@ -444,6 +447,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
 
   // ── Save All modified tabs ──
   const saveAll = useCallback(async () => {
+    if (collabEnabled || role === 'viewer') return
     const modifiedTabs = tabs.filter((t) => t.modified && t.type !== 'browser')
     await Promise.all(modifiedTabs.map(async (tab) => {
       try {
@@ -453,7 +457,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
         ))
       } catch { /* ignore */ }
     }))
-  }, [tabs, authFetch, documentSaves])
+  }, [tabs, authFetch, documentSaves, collabEnabled, role])
 
   // ── Git stage/unstage all via command palette ──
   // Both previously had no try/catch — invoked as onGitStageAll={gitStageAll}
@@ -671,6 +675,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
   }, [tabs, authFetch, isMobile, workspaceId])
 
   const updateContent = useCallback((key: string, newContent: string) => {
+    if (collabEnabled || role === 'viewer') return
     setTabs((prev) => prev.map((t) => {
       if (t.path !== key) return t
       const modified = newContent !== t.originalContent
@@ -678,7 +683,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
       // Editing pins the tab (leaves preview mode), like VS Code.
       return { ...t, content: newContent, modified, preview: modified ? false : t.preview }
     }))
-  }, [triggerAutoSave])
+  }, [triggerAutoSave, collabEnabled, role])
 
   const FORMAT_EXTS = new Set(['go', 'js', 'jsx', 'ts', 'tsx', 'css', 'json', 'html', 'md', 'py'])
 
@@ -688,6 +693,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
   }
 
   const formatCurrentFile = useCallback(async () => {
+    if (collabEnabled || role === 'viewer') return
     const tab = tabs.find((t) => t.path === activeTab)
     if (!tab || tab.type === 'browser') return
     const ext = (tab.name || '').split('.').pop()!.toLowerCase()
@@ -705,9 +711,10 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
         ))
       }
     } catch { /* ignore — format failure should not block save */ }
-  }, [tabs, activeTab, authFetch]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tabs, activeTab, authFetch, collabEnabled, role]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const saveFile = useCallback(async () => {
+    if (collabEnabled || role === 'viewer') return
     const tab = tabs.find((t) => t.path === activeTab)
     if (!tab?.modified || tab.type === 'browser') return
     // Format on save — run before writing so the formatted content is persisted.
@@ -749,7 +756,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
       ))
     } catch { /* ignore */ }
     setSaving(false)
-  }, [tabs, activeTab, authFetch, editorSettings.formatOnSave, documentSaves]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tabs, activeTab, authFetch, editorSettings.formatOnSave, documentSaves, collabEnabled, role]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const currentTab = tabs.find((t) => t.path === activeTab)
   const hasModified = tabs.some((t) => t.modified)
@@ -786,15 +793,9 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
     saves: documentSaves,
   })
 
-  // Collaborative editing for the active text file (CRDT via the doc WS).
-  // Gated on a workspace + a text file (no browser/image/binary) and the `collab`
-  // setting. DEFAULT OFF: the full path (provider connect + y-protocols sync +
-  // disk write-back) hasn't been verified against a live server yet, and a failed
-  // connection would hide on-disk content. Opt in via editorSettings.collab=true;
-  // a Settings toggle + live verification land in Wave 7. Single-user editing is
-  // the safe default and is completely unaffected when this is off.
-  const collabEnabled = (editorSettings.collab ?? false)
-  const collabPath = (collabEnabled && currentTab && !currentTab.type && currentTab.fileType == null)
+  // Viewers cannot open the write-capable doc endpoint. Keep their REST snapshot
+  // visible and read-only rather than showing an empty, perpetually rejected doc.
+  const collabPath = (collabEnabled && role !== 'viewer' && currentTab && !currentTab.type && currentTab.fileType == null)
     ? currentTab.rel
     : null
   const documentWorkspaceId = knownWorkspaces?.find(w => w.id === currentTab?.workspaceId)?.id
@@ -850,7 +851,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
         lspExtension={lspExtension}
         onRegisterActions={handleRegisterEditorActions}
         collab={collab}
-        editable={editable}
+        editable={editable && (!collabEnabled || collab.status === 'live')}
         breakpoints={breakpoints[absPath(activeRel)] || []}
         onToggleBreakpoint={(ln, lines) => toggleBreakpoint(activeRel, lines)}
         stopLine={currentStopLine}
@@ -960,6 +961,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
           {mobilePanel === 'code' && (
             <div className="h-full flex flex-col animate-fade-in">
               <EditorTabs tabs={tabs} activeTab={activeTab} onSelect={setActiveTab} onClose={closeTab} />
+              <CollaborationStatusIndicator status={collab.status} viewer={role === 'viewer'} />
               <div className="flex-1 min-h-0">{renderTabContent()}</div>
             </div>
           )}
@@ -1075,7 +1077,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
         {/* Right: save + auto-save status + share + theme + logout */}
         <div className="flex items-center gap-1">
           {/* Auto-save status indicator */}
-          {autoSaveStatus && (
+          {!collabEnabled && autoSaveStatus && (
             <span className="text-[11px] text-text-muted px-2 animate-fade-in">
               {autoSaveStatus === 'saving' ? 'saving…' : 'saved'}
             </span>
@@ -1344,6 +1346,7 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
           {currentTab?.type === 'browser' && (
             <span className="px-2 opacity-70">Browser Preview</span>
           )}
+          <CollaborationStatusIndicator status={collab.status} viewer={role === 'viewer'} />
           <LspStatusIndicator status={lspStatus} />
           <span className="px-2 opacity-50">UTF-8</span>
         </div>

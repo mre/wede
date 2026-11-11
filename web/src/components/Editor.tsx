@@ -181,7 +181,8 @@ export interface EditorProps {
   stopLine?: number | null
 }
 
-export default function Editor({ file, content, onChange, onSave, onCursorChange, settings = {} as EditorSettings, lspExtension = null, onRegisterActions, collab = null, editable = true, breakpoints = [], onToggleBreakpoint, stopLine = null }: EditorProps) {
+export default function Editor({ file, content, onChange, onSave, onCursorChange, settings = {} as EditorSettings, lspExtension = null, onRegisterActions, collab = null, editable: requestedEditable = true, breakpoints = [], onToggleBreakpoint, stopLine = null }: EditorProps) {
+  const editable = requestedEditable && (!collab || collab.status === 'off' || collab.status === 'live')
   const containerRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const onChangeRef = useRef(onChange)
@@ -251,7 +252,25 @@ export default function Editor({ file, content, onChange, onSave, onCursorChange
       // eslint-disable-next-line @typescript-eslint/no-base-to-string
       doc: collabOn ? yt.toString() : (content || ''),
       extensions: [
+        // yCollab handles native undo by mutating Y.Text directly, before a
+        // CodeMirror transaction exists. Stop it while the connection is gated.
+        EditorView.domEventHandlers({ beforeinput: (event, view) => {
+          if (collabOn && (view.state.readOnly || !collab.provider?.wsconnected || !collab.provider?.synced)) {
+            event.preventDefault()
+            return true
+          }
+          return false
+        } }),
         ...collabExt,
+        // readOnly alone does not stop programmatic edits (e.g. an LSP result).
+        // Yjs applies remote updates to Y.Text first, so allow those through
+        // even while waiting for sync, but reject local changes until usable.
+        EditorState.transactionFilter.of(tr => {
+          if (!tr.docChanged || !collabOn) return tr
+          const connected = collab.provider?.wsconnected && collab.provider?.synced
+          if (connected && !tr.startState.readOnly) return tr
+          return tr.newDoc.toString() === yt.toJSON() ? tr : []
+        }),
         lineNumbers(),
         highlightActiveLineGutter(),
         highlightActiveLine(),

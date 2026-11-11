@@ -176,7 +176,7 @@ it('creates a fresh client when collaborative Y.Text rebuilds the actual Editor'
   const ytext = doc.getText('content')
   ytext.insert(0, 'collaborative text')
   try {
-    await commit(() => root.render(<Harness collab={{ ytext, awareness, provider: null }} />))
+    await commit(() => root.render(<Harness collab={{ ytext, awareness, provider: null, status: 'syncing' }} />))
     expect(first.closeCalls).toBe(1)
     expect(LspSocket.instances).toHaveLength(2)
     const second = LspSocket.instances[1]

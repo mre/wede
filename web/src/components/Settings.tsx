@@ -5,6 +5,7 @@ import Logo from './Logo'
 import TunnelSettings from './TunnelSettings'
 import WedeLocation from './WedeLocation'
 import type { AuthFetch, EditorSettings } from '../types'
+import { collaborationRequired, effectiveCollaboration } from '../lib/collaboration'
 
 interface TrustState {
   trusted: boolean
@@ -69,7 +70,7 @@ export default function Settings({ visible, onClose, onOpenFolder, workspace, ed
   const minimap      = s.minimap      ?? false
   const lspOn        = s.lsp          ?? true
   const formatOnSave = s.formatOnSave ?? false
-  const collab       = s.collab       ?? false
+  const collab       = effectiveCollaboration(s)
   const shareCursors = s.shareCursors ?? true
 
   // Derive LSP status hint for the user.
@@ -236,7 +237,7 @@ export default function Settings({ visible, onClose, onOpenFolder, workspace, ed
             <label className="flex items-center justify-between bg-bg-primary border border-border rounded-lg px-3 py-2.5 cursor-pointer group">
               <div>
                 <span className="text-xs text-text-secondary group-hover:text-text-primary transition-colors">Auto-save</span>
-                <span className="block text-[10px] text-text-muted">1.5 s after last edit</span>
+                <span className="block text-[10px] text-text-muted">{collab ? 'REST auto-save is inactive during collaboration' : '1.5 s after last edit'}</span>
               </div>
               <Toggle checked={autoSave} onChange={(v) => update({ autoSave: v })} />
             </label>
@@ -251,7 +252,7 @@ export default function Settings({ visible, onClose, onOpenFolder, workspace, ed
             <label className="flex items-center justify-between bg-bg-primary border border-border rounded-lg px-3 py-2.5 cursor-pointer group">
               <div>
                 <span className="text-xs text-text-secondary group-hover:text-text-primary transition-colors">Format on save</span>
-                <span className="block text-[10px] text-text-muted">gofmt / prettier / black</span>
+                <span className="block text-[10px] text-text-muted">{collab ? 'Save formatting is inactive during collaboration' : 'gofmt / prettier / black'}</span>
               </div>
               <Toggle checked={formatOnSave} onChange={(v) => update({ formatOnSave: v })} />
             </label>
@@ -277,9 +278,9 @@ export default function Settings({ visible, onClose, onOpenFolder, workspace, ed
             <label className="flex items-center justify-between bg-bg-primary border border-border rounded-lg px-3 py-2.5 cursor-pointer group">
               <div>
                 <span className="text-xs text-text-secondary group-hover:text-text-primary transition-colors">Collaborative editing</span>
-                <span className="block text-[10px] text-text-muted">Real-time multi-user editing for the active file (experimental)</span>
+                <span className="block text-[10px] text-text-muted">{collaborationRequired() ? 'Required by this shared deployment. Editing waits for a live, synced connection. Viewers use read-only file snapshots.' : 'Real-time multi-user editing for the active file (experimental)'}</span>
               </div>
-              <Toggle checked={collab} onChange={(v) => update({ collab: v })} />
+              {collaborationRequired() ? <span className="text-xs text-text-muted">Required</span> : <Toggle checked={collab} onChange={(v) => update({ collab: v })} />}
             </label>
 
             {/* Live cursors */}

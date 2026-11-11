@@ -7,8 +7,8 @@
 // shared Y.Text 'content' plus the provider/awareness so the editor can bind a
 // yCollab extension and render remote cursors.
 //
-// Defensive by design: missing inputs or any construction error leave collab
-// inactive (all nulls); the editor falls back to its normal single-user mode.
+// Connection failures never discard the document: the provider reconnects with
+// its existing Y.Doc, including edits not yet delivered to the server.
 
 import { useEffect, useState } from 'react'
 import * as Y from 'yjs'
@@ -23,13 +23,16 @@ export interface UseYDocParams {
   color?: string
 }
 
+export type CollaborationStatus = 'off' | 'connecting' | 'syncing' | 'live' | 'disconnected' | 'error'
+
 export interface UseYDocState {
+  status: CollaborationStatus
   ytext: Y.Text | null
   provider: WebsocketProvider | null
   awareness: Awareness | null
 }
 
-const INACTIVE: UseYDocState = { ytext: null, provider: null, awareness: null }
+const INACTIVE: UseYDocState = { ytext: null, provider: null, awareness: null, status: 'off' }
 
 // b64urlPath encodes a (possibly UTF-8) path as base64url without padding —
 // byte-for-byte compatible with Go's base64.RawURLEncoding used by decodeRoom.
@@ -58,6 +61,7 @@ export function useYDoc({ workspaceId, path, token, username, color }: UseYDocPa
       return undefined
     }
 
+    let active = true
     let ydoc: Y.Doc | undefined
     let provider: WebsocketProvider | undefined
     try {
@@ -74,16 +78,30 @@ export function useYDoc({ workspaceId, path, token, username, color }: UseYDocPa
         color: color || '#888',
       })
       const ytext = ydoc.getText('content')
-      setState({ identity, value: { ytext, provider, awareness: provider.awareness } })
+      const session = provider
+      const publish = (status: CollaborationStatus) => {
+        if (active) setState({ identity, value: { ytext, provider: session, awareness: session.awareness, status } })
+      }
+      session.on('status', ({ status }: { status: string }) => {
+        publish(status === 'connected' ? (session.synced ? 'live' : 'syncing')
+          : status === 'connecting' ? 'connecting' : 'disconnected')
+      })
+      session.on('sync', (synced: boolean) => {
+        publish(session.wsconnected ? (synced ? 'live' : 'syncing') : 'disconnected')
+      })
+      session.on('connection-error', () => publish('error'))
+      session.on('connection-close', () => publish('disconnected'))
+      publish(session.wsconnected ? (session.synced ? 'live' : 'syncing') : 'connecting')
     } catch {
-      // Construction failed → collab inactive; editor stays single-user.
+      // Surface failure so the caller can block editing rather than REST fallback.
       try { if (provider) provider.destroy() } catch { /* ignore */ }
       try { if (ydoc) ydoc.destroy() } catch { /* ignore */ }
-      setState(null)
+      setState({ identity, value: { ...INACTIVE, status: 'error' } })
       return undefined
     }
 
     return () => {
+      active = false
       try { provider?.destroy() } catch { /* ignore */ }
       try { ydoc?.destroy() } catch { /* ignore */ }
     }
@@ -92,5 +110,6 @@ export function useYDoc({ workspaceId, path, token, username, color }: UseYDocPa
 
   // Effects replace the provider after commit. Never let that intervening render
   // bind the new file's editor to the previous file's (possibly destroyed) Y.Text.
-  return state?.identity === identity ? state.value : INACTIVE
+  return state?.identity === identity ? state.value
+      : { ...INACTIVE, status: path ? (workspaceId && token ? 'connecting' : 'error') : 'off' }
 }
