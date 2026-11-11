@@ -1068,10 +1068,19 @@ export default function IDE({ token, authFetch, onLogout, workspace, recents, on
           <div className="w-px h-4 bg-border mx-0.5" />
 
           <button onClick={() => openBrowser()}
-            className="flex items-center px-2 py-1 rounded-md text-[12px] text-text-muted hover:text-text-primary hover:bg-bg-hover transition-colors"
+            className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[12px] text-text-muted hover:text-text-primary hover:bg-bg-hover transition-colors"
             title="Open Browser Preview">
             <Globe className="w-3.5 h-3.5" />
+            Preview
           </button>
+          {role === 'owner' && (
+            <button onClick={() => setShowShareModal(true)}
+              className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[12px] font-medium text-accent bg-accent/10 hover:bg-accent/20 transition-colors"
+              title="Create or manage invite links">
+              <Share2 className="w-3.5 h-3.5" />
+              Share
+            </button>
+          )}
         </div>
 
         {/* Right: save + auto-save status + share + theme + logout */}
