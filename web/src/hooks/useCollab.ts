@@ -16,7 +16,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import type { PresenceMember, MousePosition, TerminalSession } from '../types'
 
-function buildWsUrl(workspaceId: string, token: string, username: string | null | undefined): string {
+function buildWsUrl(workspaceId: string, token: string): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   // In dev (Vite on 5173/5174) the WS must hit the backend on :9090 directly.
   const port = window.location.port
@@ -25,7 +25,6 @@ function buildWsUrl(workspaceId: string, token: string, username: string | null 
     : window.location.host
   return `${proto}//${host}/api/workspaces/${encodeURIComponent(workspaceId)}/collab`
     + `?token=${encodeURIComponent(token)}`
-    + `&username=${encodeURIComponent(username || '')}`
 }
 
 const THROTTLE_MS = 150
@@ -87,7 +86,7 @@ export function useCollab(
     let disposed = false
     let ws: WebSocket | undefined
     try {
-      ws = new WebSocket(buildWsUrl(workspaceId, token, username))
+      ws = new WebSocket(buildWsUrl(workspaceId, token))
       wsRef.current = ws
       ws.onmessage = (ev: MessageEvent) => {
         try {
@@ -129,6 +128,7 @@ export function useCollab(
       try { if (ws) ws.close() } catch { /* ignore */ }
       if (wsRef.current === ws) wsRef.current = null
     }
+  // Reconnect after a confirmed rename: the server reads the name from the session.
   }, [workspaceId, token, username])
 
   const send = useCallback((obj: unknown) => {

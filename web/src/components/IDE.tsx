@@ -69,7 +69,7 @@ export interface IDEProps {
   workspacesApi: ReturnType<typeof useWorkspaces>
   workspaceId: string | null
   username: string
-  onUsernameChange: (name: string) => void
+  onUsernameChange: (name: string) => Promise<string>
   role: string
 }
 

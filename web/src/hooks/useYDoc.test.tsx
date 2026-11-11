@@ -64,7 +64,6 @@ it.each([
   { path: 'other.rs' },
   { workspaceId: 'two' },
   { token: 'new-token' },
-  { username: 'renamed' },
 ])('hides the previous Y.Text in the very first render of a changed identity: %j', async override => {
   await commit(() => root.render(<Harness params={defaults} />))
   const previous = snapshots.at(-1)?.ytext
@@ -144,4 +143,24 @@ it('keeps the provider stable for the same identity and closes it when disabled'
   await commit(() => root.render(<Harness params={{ ...defaults, path: null }} />))
   expect(snapshots.every(s => s.ytext === null)).toBe(true)
   expect(providers[0].destroy).toHaveBeenCalledOnce()
+})
+
+it('updates awareness in place on rename/color change without losing unsent edits', async () => {
+  await commit(() => root.render(<Harness params={defaults} />))
+  const previous = snapshots.at(-1)!
+  const provider = providers[0]
+  previous.ytext!.insert(0, 'unsent')
+  provider.awareness.setLocalStateField('cursor', { anchor: 3 })
+  for (const override of [{ username: 'renamed' }, { username: 'renamed', color: '#123456' }]) {
+    snapshots = []
+    await commit(() => root.render(<Harness params={{ ...defaults, ...override }} />))
+    expect(snapshots.every(s => s.ytext === previous.ytext && s.provider === previous.provider)).toBe(true)
+    expect(provider.awareness.getLocalState()).toMatchObject({
+      user: { name: 'renamed', color: 'color' in override ? override.color : '#888' }, cursor: { anchor: 3 },
+    })
+  }
+  expect(providers).toHaveLength(1)
+  expect(provider.destroy).not.toHaveBeenCalled()
+  expect(provider.doc.isDestroyed).toBe(false)
+  expect(previous.ytext!.toJSON()).toBe('unsent')
 })

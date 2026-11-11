@@ -1,10 +1,11 @@
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { scopedUrl } from '../lib/activeWorkspace'
 import type { AuthFetch } from '../types'
 
 const API = '/api'
 
 interface AuthCheckResponse {
+  username?: string
   authenticated?: boolean
   role?: string
 }
@@ -51,19 +52,37 @@ export function useAuth() {
   const [locked, setLocked] = useState(false)
   const [remaining, setRemaining] = useState(3)
 
-  // On mount: confirm role from /api/auth/check so a persisted viewer/editor
-  // session gets the correct role even after a page reload.
+  const sessionVersion = useRef(0)
+  const nameVersion = useRef(0)
+
+  // Hydrate the session profile, but never let an older check undo a rename
+  // or clear credentials belonging to a newer session.
 
   useEffect(() => {
-    const t = localStorage.getItem('wede_token')
+    const t = token
     if (!t) return
+    let active = true
+    const session = sessionVersion.current
+    const name = nameVersion.current
     fetch(`${API}/auth/check`, { headers: { Authorization: t } })
-      .then(r => r.json())
+      .then(r => {
+        if (!r.ok) throw new Error('Could not check session')
+        return r.json()
+      })
       .then((data: AuthCheckResponse) => {
-        if (data.authenticated && data.role) {
-          setRole(data.role)
-          localStorage.setItem('wede_role', data.role)
-        } else if (!data.authenticated) {
+        if (!active || session !== sessionVersion.current || name !== nameVersion.current
+          || localStorage.getItem('wede_token') !== t) return
+        if (data.authenticated) {
+          if (data.role) {
+            setRole(data.role)
+            localStorage.setItem('wede_role', data.role)
+          }
+          if (typeof data.username === 'string') {
+            setUsername(data.username)
+            localStorage.setItem('wede_username', data.username)
+          }
+        } else if (data.authenticated === false) {
+          sessionVersion.current++
           // Session expired server-side; clear stored credentials.
           localStorage.removeItem('wede_token')
           localStorage.removeItem('wede_username')
@@ -74,10 +93,12 @@ export function useAuth() {
         }
       })
       .catch(() => {})
-  }, []) // intentionally run once on mount only
+    return () => { active = false }
+  }, [token])
 
 
   const login = useCallback(async (password: string, name = ''): Promise<boolean> => {
+    sessionVersion.current++
     setError(null)
     try {
       const res = await fetch(`${API}/auth/login`, {
@@ -118,6 +139,7 @@ export function useAuth() {
   // redeem exchanges a raw invite token for a new session and stores the result
   // exactly like login does.
   const redeem = useCallback(async (inviteToken: string): Promise<boolean> => {
+    sessionVersion.current++
     try {
       const res = await fetch(`${API}/auth/redeem`, {
         method: 'POST',
@@ -144,6 +166,8 @@ export function useAuth() {
   }, [])
 
   const logout = useCallback(() => {
+    sessionVersion.current++
+    setUsername('')
     const t = localStorage.getItem('wede_token')
     localStorage.removeItem('wede_token')
     localStorage.removeItem('wede_username')
@@ -171,14 +195,25 @@ export function useAuth() {
     return res
   }, [token, logout])
 
-  const updateUsername = useCallback((name: string | null | undefined) => {
-    const v = (name || '').trim()
-    setUsername(v)
-    try {
-      if (v) localStorage.setItem('wede_username', v)
-      else localStorage.removeItem('wede_username')
-    } catch { /* ignore */ }
-  }, [])
+  const updateUsername = useCallback(async (name: string): Promise<string> => {
+    if (!token || localStorage.getItem('wede_token') !== token) throw new Error('Not signed in')
+    const session = sessionVersion.current
+    const revision = ++nameVersion.current
+    const res = await fetch(`${API}/auth/username`, {
+      method: 'POST',
+      headers: { Authorization: token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: name.trim() }),
+    })
+    if (!res.ok) throw new Error(`Could not save display name (${res.status})`)
+    const data = await res.json() as { username?: string }
+    if (typeof data.username !== 'string') throw new Error('Invalid display name response')
+    // A response belongs only to the session and rename that issued it.
+    if (session !== sessionVersion.current || revision !== nameVersion.current
+      || localStorage.getItem('wede_token') !== token) throw new Error('Session or display name changed; please retry')
+    localStorage.setItem('wede_username', data.username)
+    setUsername(data.username)
+    return data.username
+  }, [token])
 
   return { token, username, role, login, logout, redeem, error, locked, remaining, authFetch, updateUsername }
 }

@@ -51,7 +51,7 @@ function docBaseUrl(workspaceId: string): string {
 }
 
 export function useYDoc({ workspaceId, path, token, username, color }: UseYDocParams): UseYDocState {
-  const identity = JSON.stringify([workspaceId, path, token, username, color])
+  const identity = JSON.stringify([workspaceId, path, token])
   const [state, setState] = useState<{ identity: string; value: UseYDocState } | null>(null)
 
   /* eslint-disable react-hooks/set-state-in-effect */
@@ -72,10 +72,6 @@ export function useYDoc({ workspaceId, path, token, username, color }: UseYDocPa
       provider = new WebsocketProvider(docBaseUrl(workspaceId), b64urlPath(path), ydoc, {
         params: { token },
         connect: true,
-      })
-      provider.awareness.setLocalStateField('user', {
-        name: username || 'anon',
-        color: color || '#888',
       })
       const ytext = ydoc.getText('content')
       const session = provider
@@ -105,8 +101,13 @@ export function useYDoc({ workspaceId, path, token, username, color }: UseYDocPa
       try { provider?.destroy() } catch { /* ignore */ }
       try { ydoc?.destroy() } catch { /* ignore */ }
     }
-  }, [workspaceId, path, token, username, color, identity])
+  }, [workspaceId, path, token, identity])
   /* eslint-enable react-hooks/set-state-in-effect */
+
+  const awareness = state?.identity === identity ? state.value.awareness : null
+  useEffect(() => {
+    awareness?.setLocalStateField('user', { name: username || 'anon', color: color || '#888' })
+  }, [awareness, username, color])
 
   // Effects replace the provider after commit. Never let that intervening render
   // bind the new file's editor to the previous file's (possibly destroyed) Y.Text.

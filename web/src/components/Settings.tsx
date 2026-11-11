@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { Moon, Sun, FolderOpen, Info, Minus, Plus, X, Check, User, ShieldCheck } from 'lucide-react'
 import { useTheme } from '../hooks/useTheme'
 import Logo from './Logo'
@@ -24,17 +24,35 @@ interface SettingsProps {
   role: string
   workspaceId: string | null
   username: string
-  onUsernameChange: (name: string) => void
+  onUsernameChange: (name: string) => Promise<string>
   onTrustChange: () => void
 }
 
 export default function Settings({ visible, onClose, onOpenFolder, workspace, editorSettings, onEditorSettingsChange, lspAvailable, authFetch, role, workspaceId, username, onUsernameChange, onTrustChange }: SettingsProps) {
   const { setTheme, isDark } = useTheme()
-  const [name, setName] = useState(username || '')
+  const [draftName, setDraftName] = useState<string | null>(null)
+  const name = draftName ?? username
   const [savedName, setSavedName] = useState(false)
-  const saveName = () => {
+  const [savingName, setSavingName] = useState(false)
+  const [nameError, setNameError] = useState<string | null>(null)
+  const namePending = useRef(false)
+  const saveName = async () => {
     const v = name.trim()
-    if (v && v !== username) { onUsernameChange?.(v); setSavedName(true); setTimeout(() => setSavedName(false), 1500) }
+    if (!v || v === username || namePending.current) return
+    namePending.current = true
+    setSavingName(true)
+    setSavedName(false)
+    setNameError(null)
+    try {
+      const canonical = await onUsernameChange(v)
+      setDraftName(canonical)
+      setSavedName(true)
+    } catch (error) {
+      setNameError(error instanceof Error ? error.message : 'Could not save display name')
+    } finally {
+      namePending.current = false
+      setSavingName(false)
+    }
   }
 
   // Workspace trust — gates running formatters/tasks from the project's committed
@@ -106,22 +124,24 @@ export default function Settings({ visible, onClose, onOpenFolder, workspace, ed
           <div className="flex gap-2">
             <input
               value={name}
-              onChange={(e) => setName(e.target.value)}
-              onBlur={saveName}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); saveName() } }}
+              disabled={savingName}
+              onChange={(e) => { setDraftName(e.target.value); setSavedName(false); setNameError(null) }}
+              onBlur={() => { void saveName() }}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void saveName() } }}
               placeholder="Your name"
               maxLength={40}
               className="flex-1 bg-bg-input border border-border rounded-md px-3 py-1.5 text-[13px] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/60 transition-colors"
             />
             <button
-              onClick={saveName}
-              disabled={!name.trim() || name.trim() === username}
+              onClick={() => { void saveName() }}
+              disabled={savingName || !name.trim() || name.trim() === username}
               className="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium bg-accent text-white rounded-md hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
             >
               {savedName ? <Check className="w-3.5 h-3.5" /> : null}
-              {savedName ? 'Saved' : 'Save'}
+              {savingName ? 'Saving…' : savedName ? 'Saved' : 'Save'}
             </button>
           </div>
+          {nameError && <p role="alert" className="text-[11px] text-red mt-1.5">{nameError}</p>}
           <p className="text-[11px] text-text-muted mt-1.5">Shown to collaborators in presence, chat, and live cursors.</p>
         </div>
 
