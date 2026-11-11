@@ -502,15 +502,7 @@ func (s *Server) CloseRoom(name string, force bool) error {
 		// OnUnloadDocument; nothing more for CloseRoom to do here.
 		return nil
 	}
-	delete(s.rooms, name)
-	if rm.persistStop != nil {
-		select {
-		case <-rm.persistStop:
-			// already closed by handleDisconnect
-		default:
-			close(rm.persistStop)
-		}
-	}
+	s.retireRoomLocked(name, rm)
 	s.rmu.Unlock()
 
 	if rm.persistDone != nil {

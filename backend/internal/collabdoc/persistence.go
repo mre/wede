@@ -2,6 +2,7 @@ package collabdoc
 
 import (
 	"encoding/base64"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,8 +57,14 @@ type DiskPersistence struct {
 
 	mu       sync.Mutex
 	provider DocProvider
-	timers   map[string]*time.Timer
+	timers   map[string]*pendingWrite
 	stopped  bool
+}
+
+// Each scheduled write has an identity so a cancelled callback cannot flush a
+// replacement document after the old room has been retired.
+type pendingWrite struct {
+	timer *time.Timer
 }
 
 // NewDiskPersistence returns an adapter rooted at a room's workspace directory.
@@ -65,7 +72,7 @@ func NewDiskPersistence(root string) *DiskPersistence {
 	return &DiskPersistence{
 		root:     root,
 		debounce: defaultDebounce,
-		timers:   make(map[string]*time.Timer),
+		timers:   make(map[string]*pendingWrite),
 	}
 }
 
@@ -117,59 +124,84 @@ func (p *DiskPersistence) StoreUpdate(room string, _ []byte) error {
 	if p.stopped || p.provider == nil {
 		return nil
 	}
-	if t, ok := p.timers[room]; ok {
-		t.Reset(p.debounce)
+	if pending, ok := p.timers[room]; ok {
+		pending.timer.Reset(p.debounce)
 		return nil
 	}
-	p.timers[room] = time.AfterFunc(p.debounce, func() { p.flush(room) })
+	pending := &pendingWrite{}
+	p.timers[room] = pending
+	pending.timer = time.AfterFunc(p.debounce, func() { p.flushPending(room, pending, false) })
 	return nil
 }
 
-// flush materializes the room's current doc text to disk.
+// flush is the synchronous form used by tests and explicit write-back.
 func (p *DiskPersistence) flush(room string) {
-	p.mu.Lock()
-	delete(p.timers, room)
-	prov, stopped := p.provider, p.stopped
-	p.mu.Unlock()
-	if prov == nil || stopped {
-		return
-	}
-	p.materialize(prov, room)
+	p.flushPending(room, nil, false)
 }
 
-// materialize reads the live doc text and writes it to disk atomically.
-func (p *DiskPersistence) materialize(prov DocProvider, room string) {
-	doc := prov.GetDoc(room)
-	if doc == nil {
-		return
-	}
-	text := doc.GetText(contentField).ToString()
-	full, ok := safeJoin(p.root, decodeRoom(room))
-	if !ok {
-		return
-	}
-	_ = writeAtomic(full, []byte(text))
-}
-
-// Stop cancels pending timers and performs a final synchronous flush so the last
-// edits are persisted. Called on room shutdown.
-func (p *DiskPersistence) Stop() {
+func (p *DiskPersistence) flushPending(room string, pending *pendingWrite, stopping bool) {
 	p.mu.Lock()
-	p.stopped = true
-	rooms := make([]string, 0, len(p.timers))
-	for r, t := range p.timers {
-		t.Stop()
-		rooms = append(rooms, r)
-	}
-	p.timers = make(map[string]*time.Timer)
 	prov := p.provider
 	p.mu.Unlock()
-
 	if prov == nil {
 		return
 	}
-	for _, room := range rooms {
-		p.materialize(prov, room)
+	// Never call the provider under p.mu: lifecycle flushes and room loading
+	// may need that lock. Validate the timer again after resolving the doc.
+	doc := prov.GetDoc(room)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if (p.stopped && !stopping) || (pending != nil && p.timers[room] != pending) {
+		return
+	}
+	delete(p.timers, room)
+	if err := p.materialize(room, doc); err != nil {
+		log.Printf("collabdoc: write-back %q: %v", room, err)
+	}
+}
+
+// FlushDoc is the provider's final persistence barrier. It receives the actual
+// retiring document, not a name lookup that can resolve to nil or a new room.
+// It must still write after Stop: Workspace.shutdown stops debounce timers
+// before closing sockets, and accepted edits may arrive in that interval.
+func (p *DiskPersistence) FlushDoc(room string, doc *crdt.Doc) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if pending := p.timers[room]; pending != nil {
+		pending.timer.Stop()
+		delete(p.timers, room)
+	}
+	return p.materialize(room, doc)
+}
+
+// materialize is called under p.mu, serializing timer, Stop, and lifecycle writes
+// so an older snapshot cannot finish writing after the final flush.
+func (p *DiskPersistence) materialize(room string, doc *crdt.Doc) error {
+	if doc == nil {
+		return nil
+	}
+	full, ok := safeJoin(p.root, decodeRoom(room))
+	if !ok {
+		return nil
+	}
+	return writeAtomic(full, []byte(doc.GetText(contentField).ToString()))
+}
+
+// Stop disables debouncing and synchronously flushes pending live documents.
+// The provider must subsequently be shut down: its FlushDoc barrier persists
+// accepted edits not yet delivered to StoreUpdate, including edits during Stop.
+func (p *DiskPersistence) Stop() {
+	p.mu.Lock()
+	p.stopped = true
+	pending := make(map[string]*pendingWrite, len(p.timers))
+	for room, write := range p.timers {
+		write.timer.Stop()
+		pending[room] = write
+	}
+	p.mu.Unlock()
+
+	for room, write := range pending {
+		p.flushPending(room, write, true)
 	}
 }
 

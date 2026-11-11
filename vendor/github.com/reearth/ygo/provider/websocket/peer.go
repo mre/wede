@@ -250,7 +250,7 @@ func (p *peer) handleDisconnect() {
 		roomEvicted := false
 		if empty {
 			if current, stillIn := p.server.rooms[p.roomName]; stillIn && current == rm {
-				delete(p.server.rooms, p.roomName)
+				p.server.retireRoomLocked(p.roomName, rm)
 				roomEvicted = true
 			}
 			if rm.persistStop != nil {

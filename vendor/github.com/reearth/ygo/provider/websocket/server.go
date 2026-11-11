@@ -140,6 +140,17 @@ type PersistenceAdapter interface {
 	StoreUpdate(room string, update []byte) error
 }
 
+// PersistenceFlusher is an optional lifecycle extension for adapters that debounce
+// writes. For rooms with updates, FlushDoc runs after the queue has drained, before
+// its persistence worker completes and before the same room name can be reloaded.
+// The document is passed directly because it is no longer in GetDoc's live map.
+// Implementations must flush synchronously and must not re-enter room creation.
+// Errors are logged; as with StoreUpdate, storage failures are not retried here.
+// Callers must stop mutating a document before closing its room.
+type PersistenceFlusher interface {
+	FlushDoc(room string, doc *crdt.Doc) error
+}
+
 // PersistenceAdapterContext is an optional extension to PersistenceAdapter.
 // Adapters that implement this interface receive a context that is cancelled
 // when the server begins shutdown, letting the adapter abort in-flight writes
@@ -227,6 +238,7 @@ type Server struct {
 	upgrader    gws.Upgrader
 	rmu         sync.RWMutex
 	rooms       map[string]*room
+	retiring    map[string]*room // evicted rooms whose final persistence is still running
 	persistence PersistenceAdapter
 
 	// relay, when non-nil, mirrors local doc/awareness changes to other server
@@ -590,6 +602,7 @@ func (s *Server) newPeerLimiter() *rate.Limiter {
 func NewServer() *Server {
 	s := &Server{
 		rooms:      make(map[string]*room),
+		retiring:   make(map[string]*room),
 		shutdownCh: make(chan struct{}),
 	}
 	s.upgrader = gws.Upgrader{CheckOrigin: s.checkOrigin}
@@ -614,20 +627,26 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	// Collect all active peer connections and persistence channels.
-	s.rmu.RLock()
+	s.rmu.Lock()
 	var conns []*gws.Conn
 	var persistDones []chan struct{}
-	for _, r := range s.rooms {
+	for name, r := range s.rooms {
 		r.mu.Lock()
 		for p := range r.peers {
 			conns = append(conns, p.conn)
+		}
+		if len(r.peers) == 0 {
+			s.retireRoomLocked(name, r)
 		}
 		r.mu.Unlock()
 		if r.persistDone != nil {
 			persistDones = append(persistDones, r.persistDone)
 		}
 	}
-	s.rmu.RUnlock()
+	for _, r := range s.retiring {
+		persistDones = append(persistDones, r.persistDone)
+	}
+	s.rmu.Unlock()
 
 	// Close each connection. The peer read loop will exit on the next
 	// ReadMessage call, triggering handleDisconnect cleanup.
@@ -676,6 +695,27 @@ func (s *Server) GetDoc(name string) *crdt.Doc {
 
 func (s *Server) getOrCreateRoom(ctx context.Context, name string) (*room, error) {
 	s.rmu.Lock()
+	for {
+		select {
+		case <-s.shutdownCh:
+			s.rmu.Unlock()
+			return nil, ErrServerShutdown
+		default:
+		}
+		previous, retiring := s.retiring[name]
+		if !retiring {
+			break
+		}
+		s.rmu.Unlock()
+		select {
+		case <-previous.persistDone:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.shutdownCh:
+			return nil, ErrServerShutdown
+		}
+		s.rmu.Lock()
+	}
 	defer s.rmu.Unlock()
 	if r, ok := s.rooms[name]; ok {
 		return r, nil
@@ -839,7 +879,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (it needs rmu.Lock), closing the TOCTOU window between getOrCreateRoom
 	// and peer addition.
 	s.rmu.RLock()
-	if current, ok := s.rooms[name]; !ok || current != rm {
+	shuttingDown := false
+	select {
+	case <-s.shutdownCh:
+		shuttingDown = true
+	default:
+	}
+	if current, ok := s.rooms[name]; shuttingDown || !ok || current != rm {
 		s.rmu.RUnlock()
 		if rm.peerSem != nil {
 			rm.peerSem.Release(1)

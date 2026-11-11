@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/reearth/ygo/crdt"
 )
@@ -191,6 +192,90 @@ func TestStopFlushesPending(t *testing.T) {
 	// After Stop, further StoreUpdate is a no-op (no panic, returns nil).
 	if err := p.StoreUpdate("a.txt", nil); err != nil {
 		t.Errorf("StoreUpdate after Stop: %v", err)
+	}
+}
+
+type delayedDocProvider struct {
+	doc     *crdt.Doc
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *delayedDocProvider) GetDoc(string) *crdt.Doc {
+	close(p.entered)
+	<-p.release
+	return p.doc
+}
+
+func TestFinalFlushSupersedesPendingWrite(t *testing.T) {
+	for _, stopping := range []bool{false, true} {
+		name := "timer"
+		if stopping {
+			name = "stop"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := NewDiskPersistence(t.TempDir())
+			p.debounce = time.Hour
+			prov := &delayedDocProvider{doc: docWith("old"), entered: make(chan struct{}), release: make(chan struct{})}
+			p.SetProvider(prov)
+			if err := p.StoreUpdate("a.txt", nil); err != nil {
+				t.Fatal(err)
+			}
+			p.mu.Lock()
+			pending := p.timers["a.txt"]
+			p.mu.Unlock()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if stopping {
+					p.Stop()
+				} else {
+					p.flushPending("a.txt", pending, false)
+				}
+			}()
+			<-prov.entered
+			if err := p.FlushDoc("a.txt", docWith("final")); err != nil {
+				t.Fatal(err)
+			}
+			close(prov.release)
+			<-done
+			assertDiskText(t, p, "final")
+			p.Stop()
+		})
+	}
+}
+
+func TestFinalFlushPreservesPathContainment(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "workspace")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := NewDiskPersistence(root)
+	for _, room := range []string{"../escape.txt", base64.RawURLEncoding.EncodeToString([]byte("../escape.txt"))} {
+		if err := p.FlushDoc(room, docWith("nope")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(parent, "escape.txt")); !os.IsNotExist(err) {
+		t.Fatalf("final flush escaped root: %v", err)
+	}
+	if err := p.FlushDoc(base64.RawURLEncoding.EncodeToString([]byte("src/a.txt")), docWith("safe")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "src/a.txt"))
+	if err != nil || string(data) != "safe" {
+		t.Fatalf("nested write = %q, err=%v", data, err)
+	}
+}
+
+func TestFinalFlushReturnsWriteError(t *testing.T) {
+	p := NewDiskPersistence(t.TempDir())
+	if err := os.WriteFile(filepath.Join(p.root, "blocked"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.FlushDoc("blocked/a.txt", docWith("text")); err == nil {
+		t.Fatal("expected final persistence error")
 	}
 }
 
