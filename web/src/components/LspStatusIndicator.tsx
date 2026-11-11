@@ -7,12 +7,18 @@ export default function LspStatusIndicator({ status }: { status: LspStatus | nul
     <span
       role="status"
       aria-live="polite"
-      className={`px-2 rounded-sm cursor-default ${unavailable ? 'text-yellow' : 'opacity-80'}`}
+      className={`px-2 rounded-sm cursor-default ${unavailable || status.state === 'warning' ? 'text-yellow' : 'opacity-80'}`}
       title={unavailable
         ? `${status.message} No automatic retry. Switch files or toggle LSP in Settings to try again.`
         : status.message}
     >
-      {unavailable ? 'LSP unavailable' : status.state === 'connecting' ? 'LSP connecting…' : 'LSP ready'}
+      {{
+        unavailable: 'LSP unavailable',
+        connecting: 'LSP connecting…',
+        connected: 'LSP connected',
+        indexing: 'LSP indexing…',
+        warning: 'LSP warning',
+      }[status.state]}
     </span>
   )
 }

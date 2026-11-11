@@ -266,6 +266,129 @@ describe('editor-owned LSP', () => {
   })
 })
 
+describe('LSP status', () => {
+  function notify(socket: LspSocket, params: unknown, method = 'experimental/serverStatus') {
+    socket.receive({ jsonrpc: '2.0', method, params })
+  }
+
+  it.each(['rust', 'go'])('reports only connected after %s initialization', async languageId => {
+    const onStatus = vi.fn()
+    editor(lspExtension({ ...config, languageId, onStatus }))
+    await flushLsp()
+    expect(onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connecting' }))
+    const socket = LspSocket.instances[0]
+    socket.open()
+    await flushLsp()
+    expect(onStatus).toHaveBeenCalledTimes(1)
+    expect(socket.sent[0].params?.capabilities).toMatchObject({ window: { workDoneProgress: false } })
+    if (languageId === 'rust') {
+      expect(socket.sent[0].params?.capabilities).toHaveProperty('experimental.serverStatusNotification', true)
+    } else {
+      expect(socket.sent[0].params?.capabilities).not.toHaveProperty('experimental.serverStatusNotification')
+      notify(socket, { health: 'warning', quiescent: false, message: 'Not a Rust session' })
+    }
+    socket.initialized()
+    await flushLsp()
+    expect(onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected' }))
+    if (languageId === 'rust') expect(onStatus.mock.lastCall?.[0].message).toContain('does not confirm this file belongs to a crate')
+  })
+
+  it.each(['before', 'after'])('retains indexing and health warnings received %s initialize', async ordering => {
+    const onStatus = vi.fn()
+    editor(lspExtension({ ...config, onStatus }))
+    await flushLsp()
+    const socket = LspSocket.instances[0]
+    socket.open()
+    await flushLsp()
+    if (ordering === 'after') {
+      socket.initialized()
+      await flushLsp()
+    }
+    notify(socket, { health: 'ok', quiescent: false })
+    expect(onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'indexing' }))
+    notify(socket, { health: 'warning', quiescent: false, message: 'Failed to load workspace' })
+    expect(onStatus).toHaveBeenLastCalledWith({ state: 'warning', message: 'Failed to load workspace' })
+    if (ordering === 'before') {
+      socket.initialized()
+      await flushLsp()
+      expect(onStatus).toHaveBeenLastCalledWith({ state: 'warning', message: 'Failed to load workspace' })
+    }
+    notify(socket, { health: 'error', quiescent: true })
+    expect(onStatus).toHaveBeenLastCalledWith({ state: 'warning', message: 'Rust language server reported an error.' })
+    notify(socket, { health: 'ok', quiescent: false })
+    expect(onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'indexing' }))
+    notify(socket, { health: 'ok', quiescent: true })
+    expect(onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'connected' }))
+    expect(socket.closeCalls).toBe(0)
+  })
+
+  it('does not overwrite early indexing with initialization success', async () => {
+    const onStatus = vi.fn()
+    editor(lspExtension({ ...config, onStatus }))
+    await flushLsp()
+    const socket = LspSocket.instances[0]
+    socket.open()
+    await flushLsp()
+    notify(socket, { health: 'ok', quiescent: false })
+    socket.initialized()
+    await flushLsp()
+    expect(onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'indexing' }))
+  })
+
+  it.each([1, 2])('retains bounded showMessage type %s across initialization and healthy updates without disabling features', async type => {
+    const onStatus = vi.fn()
+    const view = editor(lspExtension({ ...config, onStatus }))
+    await flushLsp()
+    const socket = LspSocket.instances[0]
+    socket.open()
+    await flushLsp()
+    notify(socket, { type, message: 'x'.repeat(600) }, 'window/showMessage')
+    socket.initialized()
+    await flushLsp()
+    notify(socket, { health: 'ok', quiescent: true })
+    notify(socket, { type: 3, message: 'Informational message' }, 'window/showMessage')
+    expect(onStatus).toHaveBeenLastCalledWith({ state: 'warning', message: 'x'.repeat(500) })
+    view.dispatch({ changes: { from: 0, insert: 'still usable' } })
+    await flushLsp()
+    expect(socket.sent.at(-1)?.method).toBe('textDocument/didChange')
+    expect(socket.closeCalls).toBe(0)
+    notify(socket, { type, message: 'Current file is not included in a crate' }, 'window/showMessage')
+    expect(onStatus).toHaveBeenLastCalledWith({ state: 'warning', message: 'Current file is not included in a crate' })
+    socket.close()
+    expect(onStatus).toHaveBeenLastCalledWith({ state: 'unavailable', message: 'Current file is not included in a crate' })
+  })
+
+  it('bounds health messages and ignores malformed notifications', async () => {
+    const onStatus = vi.fn()
+    editor(lspExtension({ ...config, onStatus }))
+    await flushLsp()
+    const socket = LspSocket.instances[0]
+    await initialize(socket)
+    notify(socket, { health: 'warning', quiescent: true, message: 'w'.repeat(600) })
+    expect(onStatus).toHaveBeenLastCalledWith({ state: 'warning', message: 'w'.repeat(500) })
+    onStatus.mockClear()
+    for (const params of [null, {}, { health: 'ok' }, { health: 'ok', quiescent: 'false' }, { health: 'unknown', quiescent: true }]) notify(socket, params)
+    notify(socket, { type: 2, message: 42 }, 'window/showMessage')
+    expect(onStatus).not.toHaveBeenCalled()
+  })
+
+  it.each(['destroy', 'disconnect'])('ignores late notifications after %s', async shutdown => {
+    const onStatus = vi.fn()
+    const view = editor(lspExtension({ ...config, onStatus }))
+    await flushLsp()
+    const socket = LspSocket.instances[0]
+    await initialize(socket)
+    if (shutdown === 'destroy') view.destroy()
+    else socket.close()
+    onStatus.mockClear()
+    notify(socket, { health: 'ok', quiescent: false })
+    notify(socket, { health: 'warning', quiescent: true, message: 'Late warning' })
+    notify(socket, { type: 1, message: 'Late error' }, 'window/showMessage')
+    await flushLsp()
+    expect(onStatus).not.toHaveBeenCalled()
+  })
+})
+
 describe('Rust resource settings', () => {
   const sections = [
     undefined, '', 'rust-analyzer', 'rust-analyzer.numThreads',

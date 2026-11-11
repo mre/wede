@@ -84,7 +84,7 @@ it('shows capacity failure in the status bar without reconnecting and isolates t
     second.initialized()
     await flushLsp()
   })
-  expect(container.querySelector('[role="status"]')?.textContent).toBe('LSP ready')
+  expect(container.querySelector('[role="status"]')?.textContent).toBe('LSP connected')
   await commit(() => root.render(<Harness params={{ ...next, lspEnabled: false }} />))
   expect(container.querySelector('[role="status"]')).toBeNull()
 })

@@ -28,7 +28,7 @@ for (const autoSave of [false, true]) {
     try {
       await page.goto('/')
       await page.getByText('main.go', { exact: true }).click()
-      await expect(page.getByRole('status')).toHaveText('LSP ready')
+      await expect(page.getByRole('status')).toHaveText('LSP connected')
       const editor = page.locator('.cm-content')
       await editor.click()
       await page.keyboard.press('ControlOrMeta+End')

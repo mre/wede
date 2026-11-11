@@ -4,7 +4,7 @@ import { LanguageServerClient, languageServerWithTransport, type Transport } fro
 import type { DocumentSaves } from './documentSaves'
 
 export interface LspStatus {
-  state: 'connecting' | 'ready' | 'unavailable'
+  state: 'connecting' | 'connected' | 'indexing' | 'warning' | 'unavailable'
   message: string
 }
 
@@ -65,7 +65,7 @@ class OpenSocketTransport implements Transport {
   constructor(
     private socket: WebSocket,
     private workspaceFolders: { uri: string; name: string }[],
-    private onServerMessage: (message: string) => void,
+    private onServerNotification: (method: string, params: Record<string, unknown>) => void,
     private configuration: (section: unknown) => unknown,
   ) {
     socket.addEventListener('close', () => this.close(), { signal: this.listeners.signal })
@@ -135,8 +135,8 @@ class OpenSocketTransport implements Transport {
       // The package dispatches by pending ID before checking method. Server and
       // client IDs are independent: intercept requests, including ID 0, first.
       if (!this.handleServerRequest(message)) {
-        if (isRecord(message) && message.method === 'window/showMessage' && isRecord(message.params) && typeof message.params.message === 'string') {
-          this.onServerMessage(message.params.message.slice(0, 500))
+        if (isRecord(message) && !('id' in message) && typeof message.method === 'string' && isRecord(message.params)) {
+          this.onServerNotification(message.method, message.params)
         }
         callback(event.data)
       }
@@ -177,6 +177,41 @@ export function lspExtension(config: LspConfig): Extension[] {
     let client: DocumentClient | undefined
     let pendingSaved: string | undefined
     let serverMessage: string | undefined
+    let initialized = false
+    let indexing = false
+    let healthWarning: string | undefined
+
+    function reportStatus() {
+      if (stopped) return
+      const warning = healthWarning || serverMessage
+      // Server health is workspace-wide, not evidence that this file belongs to a crate.
+      const scope = rust ? ' Rust workspace status does not confirm this file belongs to a crate.' : ''
+      const status: LspStatus = warning
+        ? { state: 'warning', message: warning }
+        : indexing
+          ? { state: 'indexing', message: 'Rust language server is indexing the workspace.' + scope }
+          : initialized
+            ? { state: 'connected', message: 'Language server connected.' + scope }
+            : { state: 'connecting', message: 'Connecting to the language server…' }
+      config.onStatus?.(status)
+    }
+
+    function serverNotification(method: string, params: Record<string, unknown>) {
+      if (stopped) return
+      if (method === 'window/showMessage' && (params.type === 1 || params.type === 2) && typeof params.message === 'string') {
+        // These messages have no matching clear event; retain the latest warning
+        // for this session rather than hide it on a later healthy/indexing update.
+        serverMessage = params.message.trim().slice(0, 500) || 'Language server reported a problem.'
+      } else if (rust && method === 'experimental/serverStatus' &&
+        (params.health === 'ok' || params.health === 'warning' || params.health === 'error') &&
+        typeof params.quiescent === 'boolean') {
+        indexing = !params.quiescent
+        healthWarning = params.health === 'ok' ? undefined
+          : (typeof params.message === 'string' ? params.message.trim().slice(0, 500) : '') ||
+            `Rust language server reported ${params.health === 'error' ? 'an error' : 'a warning'}.`
+      } else return
+      reportStatus()
+    }
     const persistence = config.persistence
     const unsubscribe = persistence?.events.subscribe(persistence.workspaceId, persistence.path, content => {
       if (stopped) return
@@ -187,7 +222,7 @@ export function lspExtension(config: LspConfig): Extension[] {
 
     function fail(message = 'Language server unavailable. It may be at capacity or the connection failed.') {
       if (stopped) return
-      config.onStatus?.({ state: 'unavailable', message: serverMessage || message })
+      config.onStatus?.({ state: 'unavailable', message: healthWarning || serverMessage || message })
       stop()
     }
 
@@ -220,6 +255,7 @@ export function lspExtension(config: LspConfig): Extension[] {
           didChangeConfiguration: { dynamicRegistration: false },
         }
         params.capabilities.window = { workDoneProgress: false }
+        if (rust) params.capabilities.experimental = { serverStatusNotification: true }
         params.capabilities.textDocument = {
           ...params.capabilities.textDocument,
           synchronization: { ...params.capabilities.textDocument?.synchronization, didSave: true },
@@ -281,7 +317,7 @@ export function lspExtension(config: LspConfig): Extension[] {
           if (stopped || !socket) return
           clearTimeout(connectTimer)
           transport = new OpenSocketTransport(
-            socket, workspaceFolders, message => { serverMessage = message },
+            socket, workspaceFolders, serverNotification,
             section => rust ? rustConfiguration(section) : null,
           )
           const sessionClient = new DocumentClient({
@@ -305,7 +341,8 @@ export function lspExtension(config: LspConfig): Extension[] {
               client: sessionClient,
               transport: sessionTransport,
             })) })
-            if (!stopped) config.onStatus?.({ state: 'ready', message: 'Language server connected' })
+            initialized = true
+            reportStatus()
           }).catch(() => fail())
         }, { once: true, signal: listeners.signal })
       } catch {
