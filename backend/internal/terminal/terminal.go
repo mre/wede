@@ -21,49 +21,113 @@ type WorkspaceProvider interface {
 	OnChange(func(string))
 }
 
-// subscriber is one websocket attached to a shared terminal session. Each has
-// its own write mutex so concurrent broadcasts to different subscribers don't
-// serialize through a single lock, while writes to the *same* socket stay ordered.
-type subscriber struct {
-	conn *websocket.Conn
-	wmu  sync.Mutex
+const socketWriteTimeout = 5 * time.Second
+
+type outbound struct {
+	kind int
+	data []byte
 }
 
-// write serializes a single message to this subscriber's socket.
-func (sub *subscriber) write(msgType int, data []byte) error {
-	sub.wmu.Lock()
-	defer sub.wmu.Unlock()
-	return sub.conn.WriteMessage(msgType, data)
+// Subscriber geometry and queue publication are guarded by session.mu.
+// A single writer owns each socket; slow viewers cannot block the session.
+type subscriber struct {
+	conn       *websocket.Conn
+	v2         bool
+	cols, rows int
+	visible    bool
+	out        chan outbound
+	stop       chan struct{}
+}
+
+func (sub *subscriber) write(kind int, data []byte) error {
+	if err := sub.conn.SetWriteDeadline(time.Now().Add(socketWriteTimeout)); err != nil {
+		return err
+	}
+	return sub.conn.WriteMessage(kind, data)
+}
+
+func (s *session) writeLoop(sub *subscriber) {
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+	defer s.removeSub(sub)
+	for {
+		select {
+		case <-sub.stop:
+			return
+		case msg, ok := <-sub.out:
+			if !ok {
+				return
+			}
+			if err := sub.write(msg.kind, msg.data); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if err := sub.write(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // session holds a persistent pty shared by all subscribers in a room. The pty
 // survives websocket reconnects and is fanned out to every connected subscriber.
 type session struct {
-	id     string
-	ptmx   *os.File
-	cmd    *exec.Cmd
-	mu     sync.Mutex               // guards subs + closed
-	subs   map[*subscriber]struct{} // all connected viewers (shared terminal)
-	pmu    sync.Mutex               // serializes input writes to the pty
-	buf    *ringBuffer              // scrollback buffer for replay on (re)connect
-	done   chan struct{}
-	closed bool
+	id         string
+	ptmx       *os.File
+	cmd        *exec.Cmd
+	mu         sync.Mutex               // guards subs, closed, geometry and event publication
+	subs       map[*subscriber]struct{} // all connected viewers (shared terminal)
+	pmu        sync.Mutex               // serializes input writes to the pty
+	buf        *ringBuffer              // scrollback buffer for replay on (re)connect
+	done       chan struct{}
+	closed     bool
+	cols, rows int
+	revision   uint64
+	drainTimer *time.Timer // guards the total EOF drain, not just each socket write
 }
 
-// addSub registers a websocket as a subscriber and returns its handle.
-func (s *session) addSub(conn *websocket.Conn) *subscriber {
-	sub := &subscriber{conn: conn}
+// addSub atomically queues initial size, replay, then admits live output.
+// The raw replay is a byte tail, not a terminal-state snapshot.
+func (s *session) addSub(conn *websocket.Conn, v2 bool) *subscriber {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	sub := &subscriber{conn: conn, v2: v2, out: make(chan outbound, 64), stop: make(chan struct{})}
+	if v2 {
+		sub.out <- outbound{websocket.TextMessage, s.sizeMessage()}
+	}
+	if replay := s.buf.Bytes(); len(replay) > 0 {
+		sub.out <- outbound{websocket.BinaryMessage, replay}
+	}
 	s.subs[sub] = struct{}{}
-	s.mu.Unlock()
 	return sub
 }
 
 // removeSub detaches a subscriber (does not kill the pty — the session persists).
 func (s *session) removeSub(sub *subscriber) {
 	s.mu.Lock()
-	delete(s.subs, sub)
+	if s.dropSub(sub) {
+		s.recomputeSize()
+	}
 	s.mu.Unlock()
+}
+
+// dropSub requires s.mu. Closing the socket also interrupts a blocked reader/writer.
+func (s *session) dropSub(sub *subscriber) bool {
+	if _, ok := s.subs[sub]; !ok {
+		return false
+	}
+	delete(s.subs, sub)
+	if len(s.subs) == 0 && s.drainTimer != nil {
+		s.drainTimer.Stop()
+	}
+	close(sub.stop)
+	if sub.conn != nil {
+		sub.conn.Close()
+	}
+	return true
 }
 
 // subCount reports how many viewers are currently attached.
@@ -73,39 +137,120 @@ func (s *session) subCount() int {
 	return len(s.subs)
 }
 
-// broadcast writes data to every subscriber, pruning any that error. Subscribers
-// are snapshotted under the lock, then written to outside it so a slow/blocked
-// socket can't stall the pty reader while holding s.mu.
-func (s *session) broadcast(msgType int, data []byte) {
+// publishOutput makes buffering and fanout indivisible with respect to attachment
+// and geometry changes. Callers transfer ownership of data.
+func (s *session) publishOutput(data []byte) {
 	s.mu.Lock()
-	subs := make([]*subscriber, 0, len(s.subs))
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.buf.Write(data)
 	for sub := range s.subs {
-		subs = append(subs, sub)
+		s.enqueue(sub, outbound{websocket.BinaryMessage, data})
 	}
-	s.mu.Unlock()
+	s.recomputeSize()
+}
 
-	var dead []*subscriber
-	for _, sub := range subs {
-		if err := sub.write(msgType, data); err != nil {
-			dead = append(dead, sub)
-		}
-	}
-	if len(dead) > 0 {
-		s.mu.Lock()
-		for _, sub := range dead {
-			delete(s.subs, sub)
-			sub.conn.Close()
-		}
-		s.mu.Unlock()
+// enqueue requires s.mu; an overfull queue disconnects rather than dropping bytes.
+func (s *session) enqueue(sub *subscriber, msg outbound) {
+	select {
+	case sub.out <- msg:
+	default:
+		s.dropSub(sub)
 	}
 }
 
-// closeConns closes and clears all subscriber sockets. Caller must hold s.mu.
+func (s *session) sizeMessage() []byte {
+	data, _ := json.Marshal(struct {
+		Type     string `json:"type"`
+		Cols     int    `json:"cols"`
+		Rows     int    `json:"rows"`
+		Revision uint64 `json:"revision"`
+	}{"size", s.cols, s.rows, s.revision})
+	return data
+}
+
+func validSize(cols, rows int) bool {
+	return cols >= 2 && cols <= 1000 && rows >= 1 && rows <= 500
+}
+
+func (s *session) viewport(sub *subscriber, cols, rows int, visible bool) {
+	if visible && !validSize(cols, rows) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.subs[sub]; !ok || s.closed {
+		return
+	}
+	sub.cols, sub.rows, sub.visible = cols, rows, visible
+	s.recomputeSize()
+}
+
+// recomputeSize requires s.mu. Setsize and notification publication share this
+// lock with output publication, so SIGWINCH-generated output follows its size.
+func (s *session) recomputeSize() {
+	for !s.closed {
+		cols, rows := 1001, 501
+		for sub := range s.subs {
+			if sub.visible && validSize(sub.cols, sub.rows) {
+				cols = min(cols, sub.cols)
+				rows = min(rows, sub.rows)
+			}
+		}
+		if cols == 1001 || (cols == s.cols && rows == s.rows) {
+			return
+		}
+		if err := pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)}); err != nil {
+			log.Printf("[terminal] resize failed: %v", err)
+			return
+		}
+		s.cols, s.rows = cols, rows
+		s.revision++
+		data := s.sizeMessage()
+		before := len(s.subs)
+		for sub := range s.subs {
+			if sub.v2 {
+				s.enqueue(sub, outbound{websocket.TextMessage, data})
+			}
+		}
+		if len(s.subs) == before {
+			return
+		}
+		// A failed notification may have removed the smallest viewer.
+	}
+}
+
+// finishOutput seals the queues on PTY EOF/EIO. Writers consume all queued
+// frames before closing their sockets. The shared deadline bounds the entire
+// drain, including a write already in flight; per-write deadlines alone would
+// allow a slow reader to stretch shutdown across every queued message.
+func (s *session) finishOutput(timeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return // forced shutdown already closed the sockets
+	}
+	s.closed = true
+	for sub := range s.subs {
+		close(sub.out)
+	}
+	if len(s.subs) > 0 {
+		s.drainTimer = time.AfterFunc(timeout, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.closeConns()
+		})
+	}
+}
+
+// closeConns forcibly closes sockets without draining (workspace/handler shutdown
+// or the drain deadline). Caller must hold s.mu.
 func (s *session) closeConns() {
 	for sub := range s.subs {
-		sub.conn.Close()
+		s.dropSub(sub)
 	}
-	s.subs = make(map[*subscriber]struct{})
 }
 
 // ringBuffer stores the last N bytes of terminal output for replay on reconnect.
@@ -248,9 +393,14 @@ func (h *Handler) getOrCreateSession(id string) (*session, bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if s, ok := h.sessions[id]; ok && !s.closed {
-		log.Printf("[terminal] reattaching to existing session %q (buf=%d bytes)", id, len(s.buf.data))
-		return s, true, nil
+	if s, ok := h.sessions[id]; ok {
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		if !closed {
+			log.Printf("[terminal] reattaching to existing session %q", id)
+			return s, true, nil
+		}
 	}
 	log.Printf("[terminal] creating new session %q (existing sessions: %d)", id, len(h.sessions))
 
@@ -273,7 +423,7 @@ func (h *Handler) getOrCreateSession(id string) (*session, bool, error) {
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: 80, Rows: 24})
 	if err != nil {
 		return nil, false, err
 	}
@@ -285,6 +435,8 @@ func (h *Handler) getOrCreateSession(id string) (*session, bool, error) {
 		subs: make(map[*subscriber]struct{}),
 		buf:  newRingBuffer(64 * 1024), // 64KB scrollback
 		done: make(chan struct{}),
+		cols: 80,
+		rows: 24,
 	}
 	h.sessions[id] = s
 
@@ -294,21 +446,21 @@ func (h *Handler) getOrCreateSession(id string) (*session, bool, error) {
 		buf := make([]byte, 32768)
 		for {
 			n, err := ptmx.Read(buf)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				s.publishOutput(data)
+			}
 			if err != nil {
-				s.mu.Lock()
-				s.closed = true
-				s.closeConns()
-				s.mu.Unlock()
+				s.finishOutput(socketWriteTimeout)
 				close(s.done)
 				h.mu.Lock()
-				delete(h.sessions, id)
+				if h.sessions[id] == s {
+					delete(h.sessions, id)
+				}
 				h.mu.Unlock()
 				return
 			}
-			data := make([]byte, n)
-			copy(data, buf[:n])
-			s.buf.Write(data)
-			s.broadcast(websocket.BinaryMessage, data)
 		}
 	}()
 
@@ -320,14 +472,43 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	ids := make([]string, 0, len(h.sessions))
 	for id, s := range h.sessions {
+		s.mu.Lock()
 		if !s.closed {
 			ids = append(ids, id)
 		}
+		s.mu.Unlock()
 	}
 	h.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"sessions": ids})
+}
+
+// handleControl consumes all v2 text, and only recognized resize controls for
+// legacy clients. Invalid controls never become shell input.
+func (s *session) handleControl(sub *subscriber, msg []byte) bool {
+	var header struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(msg, &header); err != nil {
+		return sub.v2
+	}
+	if (sub.v2 && header.Type != "viewport") || (!sub.v2 && header.Type != "resize") {
+		return sub.v2
+	}
+	var control struct {
+		Cols    int   `json:"cols"`
+		Rows    int   `json:"rows"`
+		Visible *bool `json:"visible"`
+	}
+	if json.Unmarshal(msg, &control) == nil {
+		if !sub.v2 {
+			s.viewport(sub, control.Cols, control.Rows, true)
+		} else if control.Visible != nil {
+			s.viewport(sub, control.Cols, control.Rows, *control.Visible)
+		}
+	}
+	return true
 }
 
 func (h *Handler) HandleWS(w http.ResponseWriter, r *http.Request) {
@@ -364,24 +545,26 @@ func (h *Handler) HandleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[terminal] ws connect: session=%q", sessionID)
-	s, reconnected, err := h.getOrCreateSession(sessionID)
+	v2 := r.URL.Query().Get("protocol") == "2"
+	s, _, err := h.getOrCreateSession(sessionID)
 	if err != nil {
 		log.Println("pty start error:", err)
-		conn.WriteMessage(websocket.TextMessage, []byte("Error starting terminal: "+err.Error()))
+		kind := websocket.TextMessage
+		if v2 {
+			kind = websocket.BinaryMessage
+		}
+		(&subscriber{conn: conn}).write(kind, []byte("Error starting terminal: "+err.Error()))
 		conn.Close()
 		return
 	}
 
-	// Attach this connection as a subscriber (shared terminal — existing viewers
-	// stay connected). _ = reconnected: replay is now unconditional below.
-	_ = reconnected
-	sub := s.addSub(conn)
-
-	// Replay scrollback so a (re)joining viewer immediately sees the current
-	// screen state. Harmless for a brand-new session (empty buffer).
-	if replay := s.buf.Bytes(); len(replay) > 0 {
-		sub.write(websocket.BinaryMessage, replay) //nolint:errcheck
+	sub := s.addSub(conn, v2)
+	if sub == nil {
+		conn.Close()
+		return
 	}
+	defer s.removeSub(sub)
+	go s.writeLoop(sub)
 
 	// Per-connection ping/pong keepalive.
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
@@ -389,58 +572,22 @@ func (h *Handler) HandleWS(w http.ResponseWriter, r *http.Request) {
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck
 		return nil
 	})
-	connDone := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(25 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if err := sub.write(websocket.PingMessage, nil); err != nil {
-					return
-				}
-			case <-connDone:
-				return
-			case <-s.done:
-				return
-			}
-		}
-	}()
 
-	// websocket -> pty. Any subscriber may type (multi-writer); pty writes are
-	// serialized via s.pmu. Resize uses a last-writer-wins policy: the most
-	// recent client's dimensions apply to the shared pty.
+	// Any subscriber may type; PTY input writes remain serialized via s.pmu.
+	// V2 reserves text frames for controls and binary frames for terminal input.
 	log.Printf("[terminal] session %q: subscriber attached (viewers=%d)", sessionID, s.subCount())
 	for {
 		msgType, msg, err := conn.ReadMessage()
 		if err != nil {
-			// This viewer disconnected — detach but keep the pty alive for others.
-			s.removeSub(sub)
-			conn.Close()
-			close(connDone)
 			return
 		}
-		if msgType == websocket.TextMessage {
-			var resize struct {
-				Type string `json:"type"`
-				Cols int    `json:"cols"`
-				Rows int    `json:"rows"`
-			}
-			if json.Unmarshal(msg, &resize) == nil && resize.Type == "resize" {
-				pty.Setsize(s.ptmx, &pty.Winsize{ //nolint:errcheck
-					Rows: uint16(resize.Rows),
-					Cols: uint16(resize.Cols),
-				})
-				continue
-			}
+		if msgType == websocket.TextMessage && s.handleControl(sub, msg) {
+			continue
 		}
 		s.pmu.Lock()
 		_, werr := io.WriteString(s.ptmx, string(msg))
 		s.pmu.Unlock()
 		if werr != nil {
-			s.removeSub(sub)
-			conn.Close()
-			close(connDone)
 			return
 		}
 	}

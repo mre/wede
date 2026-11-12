@@ -87,6 +87,8 @@ func newTestSession() *session {
 		subs: make(map[*subscriber]struct{}),
 		buf:  newRingBuffer(8),
 		done: make(chan struct{}),
+		cols: 80,
+		rows: 24,
 	}
 }
 
@@ -96,8 +98,8 @@ func TestSubscriberSetAddRemove(t *testing.T) {
 		t.Fatalf("new session subCount = %d, want 0", s.subCount())
 	}
 
-	a := s.addSub(nil)
-	b := s.addSub(nil)
+	a := s.addSub(nil, false)
+	b := s.addSub(nil, false)
 	if s.subCount() != 2 {
 		t.Fatalf("after 2 adds subCount = %d, want 2", s.subCount())
 	}
